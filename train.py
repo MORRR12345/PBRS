@@ -1,142 +1,112 @@
-# python train_agent.py 训练agent强化学习部分
+"""每轮让所有环境各完成一局，然后用合并的轨迹更新一次 PPO。"""
 
-import time
+import argparse
+from pathlib import Path
+
+import numpy as np
 import torch
-import random
+from stable_baselines3 import PPO
+from stable_baselines3.common.buffers import RolloutBuffer
+from stable_baselines3.common.logger import configure
+from tqdm.auto import tqdm
 
-from env.environment import SpaceEnv
-from agent.agent import Agent
-from agent.buffer import ExperienceBuffer
-from tool import get_savepath
-from other.show import show_agent
+import config as cfg
+from env import AvoidObstacleEnv
 
-#?#################################### 参数 ####################################?#
-NUM_ENV = 64     # 环境数量
-DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-MAX_EPOCHS = 100      # 最大训练epoch,正式训练改为1000或者3000、5000
-SAVE_EPOCHS = 50      # 保存策略间隔epoch,正式训练改为100或者500
-SHOW_EPOCHS = 10       # 打印奖励间隔epoch
+def collect_round(model, envs):
+    observations = [env.reset()[0] for env in envs]
+    trajectories = [[] for _ in envs]
+    returns = np.zeros(len(envs))
+    collisions = np.zeros(len(envs), dtype=int)
+    successes = np.zeros(len(envs), dtype=int)
+    timeouts = np.zeros(len(envs), dtype=int)
+    active = list(range(len(envs)))
+    model.policy.set_training_mode(False)
 
-# 设置随机种子
-def set_seed(seed):
-    """设置随机种子"""
-    torch.manual_seed(seed)
-    random.seed(seed)
+    while active:
+        with torch.no_grad():
+            actions, values, log_probs = model.policy(torch.as_tensor(
+                np.stack([observations[i] for i in active]), device=model.device))
+        for j, i in enumerate(active[:]):
+            action = actions[j].cpu().numpy()
+            next_obs, reward, terminated, truncated, info = envs[i].step(action)
+            trajectories[i].append((observations[i], action, reward,
+                                    values[j:j + 1], log_probs[j:j + 1]))
+            returns[i] += reward
+            collisions[i] += int(info["collision"])
+            model.num_timesteps += 1
+            observations[i] = next_obs
+            if terminated or truncated:
+                successes[i] = int(terminated)
+                timeouts[i] = int(truncated)
+                if truncated:
+                    # 超时是采样边界，对最后一步加入末状态的 bootstrap 价值。
+                    with torch.no_grad():
+                        terminal_value = model.policy.predict_values(torch.as_tensor(
+                            next_obs[None], device=model.device)).item()
+                    state, act, raw_reward, value, log_prob = trajectories[i][-1]
+                    trajectories[i][-1] = (state, act, raw_reward + cfg.GAMMA * terminal_value,
+                                           value, log_prob)
+                active.remove(i)
 
-#?#################################### 初始化 ####################################?#
+    size = sum(map(len, trajectories))
+    buffer = RolloutBuffer(size, envs[0].observation_space, envs[0].action_space,
+                           device=model.device, gamma=cfg.GAMMA, gae_lambda=model.gae_lambda)
+    for trajectory in trajectories:
+        for index, (state, action, reward, value, log_prob) in enumerate(trajectory):
+            buffer.add(state[None], action[None], np.array([reward]),
+                       np.array([index == 0]), value, log_prob)
+    # 按环境拼接完整轨迹，episode_starts 在各轨迹之间切断 GAE。
+    buffer.compute_returns_and_advantage(torch.zeros(1), np.array([True]))
+    return buffer, returns, collisions, successes, timeouts, np.array(list(map(len, trajectories)))
 
-def init():
-    """完成所有初始化"""
-    print("👊 Start Init......")
-    env = SpaceEnv(NUM_ENV) # 环境
-    agent = Agent(env.state_dim, env.act_dim, DEVICE) # 智能体
 
-    expe_buffer = ExperienceBuffer(NUM_ENV*env.max_step) # 经验回放池
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--episodes", type=int, default=cfg.TOTAL_EPISODES)
+    args = parser.parse_args()
+    if args.episodes <= 0:
+        parser.error("--episodes 必须大于零")
+    if cfg.NUM_ENVS <= 0:
+        parser.error("NUM_ENVS 必须大于零")
+    Path("models").mkdir(exist_ok=True)
+    Path("logs").mkdir(exist_ok=True)
 
-    print("👌 Init done")
+    for name in ("hard", "soft", "pbrs"):
+        envs = [AvoidObstacleEnv(name) for _ in range(cfg.NUM_ENVS)]
+        for i, env in enumerate(envs):
+            env.reset(seed=cfg.SEED + i)
+        model = PPO("MlpPolicy", envs[0], seed=cfg.SEED, gamma=cfg.GAMMA,
+                    n_steps=cfg.MAX_STEPS, batch_size=cfg.MAX_STEPS, learning_rate=3e-4,
+                    verbose=0, device="cpu")
+        model.set_logger(configure(format_strings=[]))
+        records = {key: [] for key in ("returns", "success", "collision", "timeout",
+                                      "length", "actor_loss", "critic_loss")}
+        for _ in tqdm(range(args.episodes), desc=name, unit="episode"):
+            buffer, returns, collisions, successes, timeouts, lengths = collect_round(model, envs)
+            model.rollout_buffer = buffer
+            model._update_current_progress_remaining(model.num_timesteps,
+                                                     args.episodes * cfg.MAX_STEPS * cfg.NUM_ENVS)
+            model.train()
+            losses = model.logger.name_to_value
+            records["returns"].append(float(np.mean(returns)))
+            records["success"].append(float(np.mean(successes)))
+            records["collision"].append(float(np.mean(collisions)))
+            records["timeout"].append(float(np.mean(timeouts)))
+            records["length"].append(float(np.mean(lengths)))
+            records["actor_loss"].append(losses["train/policy_gradient_loss"])
+            records["critic_loss"].append(losses["train/value_loss"])
 
-    return env, agent, expe_buffer
+        model.save(f"models/ppo_{name}")
+        np.savez(f"logs/{name}.npz", num_envs=cfg.NUM_ENVS,
+                 **{key: np.asarray(value) for key, value in records.items()})
+        print(f"{name}: success={np.mean(records['success']):.1%}, "
+              f"collision steps={np.mean(records['collision']):.1f}, "
+              f"avg_length={np.mean(records['length']):.1f}")
+        for env in envs:
+            env.close()
 
-#?#################################### 训练agent ####################################?#
-
-def train_agent(env, agent, expe_buffer):
-    """训练agent"""
-    print("⛳ Start Train Actor......")
-    set_seed(1)
-
-    # 记录用于监控训练
-    actor_losses = []
-    critic_losses = []
-    reward_history = []
-    best_reward = -1e9
-
-    # 准备工作
-    save_path = get_savepath()
-    
-    init_time = time.time()
-
-    #*#################################### train开始 ####################################*#
-    
-    for epoch in range(MAX_EPOCHS+1):
-        obs, done = env.reset()
-        expe_buffer.clear()
-        episode_reward = torch.zeros(env.num_env, 2, device=DEVICE)
-
-        #*#################################### 收集数据 ####################################*#
-
-        #* 1、收集一批数据
-        while not torch.all(done):
-            active = ~done
-            # 1、生成动作
-            actions, _, log_probs = agent.get_action(obs) # [N,n,obs] -> [N,n,action]
-
-            # 2、执行动作
-            next_obs, reward, done = env.step(actions) # [N,n,action] -> [N,reward]
-
-            # 3、存储经验
-            expe_buffer.push_batch(
-                obs,                             # obs:       [N,n,obs]
-                actions,                         # act:       [N,n,action]
-                log_probs,                       # log_probs: [N]
-                torch.sum(reward, dim=-1),       # reward:    [N]
-                next_obs,                        # next_obs:  [N,n,next_obs]
-                done,                            # done:      [N]
-                active,                          # active:    [N]
-            )
-
-            # 4、处理
-            obs = next_obs.detach().clone()
-            episode_reward += reward
-
-        #*#################################### 收集数据结束 ####################################*#
-        mean_reward = torch.mean(episode_reward, dim=0)
-        reward_history.append(mean_reward) # 记录所有环境的平均奖励
-
-        #* 2、保存目前最好的模型
-        score = torch.sum(mean_reward).item()
-        if score > best_reward and epoch > int(MAX_EPOCHS/2):
-            best_reward = score
-            torch.save(agent.actor.state_dict(), f"{save_path}/actor_pth/best_actor.pth")
-            torch.save(agent.critic.state_dict(), f"{save_path}/critic_pth/best_critic.pth")
-
-            torch.save(torch.stack(reward_history), f"{save_path}/data/best_reward_history.pt")
-            torch.save(actor_losses, f"{save_path}/data/best_actor_losses.pt")
-            torch.save(critic_losses, f"{save_path}/data/best_critic_losses.pt")
-
-        #* 3、更新actor和critic
-        expe_data = expe_buffer.prepare_all_data()
-        actor_loss, critic_loss = agent.update_actor_critic(expe_data)
-        actor_losses.append(actor_loss) # 记录
-        critic_losses.append(critic_loss) # 记录
-
-        #* 4、定期显示训练结果
-        if epoch % SHOW_EPOCHS == 0:
-            use_time_epoch = (time.time()-init_time)/SHOW_EPOCHS
-            init_time = time.time()
-            print(f"🕒 Epoch {epoch}|{MAX_EPOCHS}: "
-                  f"R:{torch.sum(mean_reward).item():.2f}, A:{actor_loss:.4f}, C:{critic_loss:.2f}, "
-                  f"{use_time_epoch:.2f} S/epoch, {use_time_epoch*epoch/60:.2f}|{use_time_epoch*MAX_EPOCHS/60:.2f}min")
-
-        #* 5、定期保存模型
-        if epoch % SAVE_EPOCHS == 0:
-            torch.save(agent.actor.state_dict(), f"{save_path}/actor_pth/actor_epoch_{epoch}.pth")
-            torch.save(agent.critic.state_dict(), f"{save_path}/critic_pth/critic_epoch_{epoch}.pth")
-
-            torch.save(torch.stack(reward_history), f"{save_path}/data/reward_history.pt")
-            torch.save(actor_losses, f"{save_path}/data/actor_losses.pt")
-            torch.save(critic_losses, f"{save_path}/data/critic_losses.pt")
-            print("Save Done")
-            torch.cuda.empty_cache()#清理缓存
-    
-    #*#################################### train结束 ####################################*#
-    show_agent(save_path)
-
-    return best_reward
 
 if __name__ == "__main__":
-    env, agent, expe_buffer = init()
-    #* 训练agent
-    best_reward = train_agent(env, agent, expe_buffer)
-    #* 结束
-    print("👍 Training completed!, 🥇 Best Reward:", best_reward)
+    main()
