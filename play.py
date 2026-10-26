@@ -13,12 +13,13 @@ from env import AvoidObstacleEnv
 
 
 def rollout(name):
+    """用指定奖励方案的模型确定性回放一局，返回路径和结束状态。"""
     env = AvoidObstacleEnv(name)
     model = PPO.load(f"models/ppo_{name}.zip", device="cpu")
     obs, _ = env.reset(seed=cfg.SEED)
     path = [env.position.copy()]
     info = {}
-    collision_steps = 0
+    collision_steps = 0  # 统计处于障碍物内的步数，而非碰撞事件次数。
     for _ in range(cfg.MAX_STEPS):
         action, _ = model.predict(obs, deterministic=True)
         obs, _, terminated, truncated, info = env.step(action)
@@ -34,6 +35,7 @@ def rollout(name):
 
 
 def main():
+    """解析回放选项，绘制并保存各模型的运动路径。"""
     parser = argparse.ArgumentParser()
     group = parser.add_mutually_exclusive_group(required=True)
     group.add_argument("--reward", choices=("hard", "soft", "pbrs"))
@@ -44,7 +46,8 @@ def main():
     fig, ax = plt.subplots(figsize=(7, 7))
     ax.add_patch(Circle(cfg.OBSTACLE_CENTER, cfg.OBSTACLE_RADIUS,
                         color="tab:red", alpha=0.35, label="obstacle"))
-    ax.add_patch(Circle(cfg.OBSTACLE_CENTER, cfg.OBSTACLE_RADIUS + cfg.AGENT_RADIUS,
+    # 虚线包含智能体半径，表示其中心不能进入的碰撞边界。
+    ax.add_patch(Circle(cfg.OBSTACLE_CENTER, cfg.OBSTACLE_RADIUS + cfg.SAFE_DISTANCE,
                         fill=False, edgecolor="tab:red", linestyle="--", alpha=0.6))
     ax.scatter(*cfg.START, marker="o", color="green", s=80, label="start", zorder=5)
     ax.scatter(*cfg.GOAL, marker="*", color="blue", s=140, label="goal", zorder=5)
